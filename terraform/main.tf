@@ -5,6 +5,11 @@ terraform {
       version = "~> 5.0"
     }
   }
+  backend "s3" {
+    bucket = "terraform-state-ticket-queue-478111025229"
+    key    = "production/terraform.tfstate"
+    region = "ap-southeast-1"
+  }
 }
 
 provider "aws" {
