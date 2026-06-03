@@ -1,0 +1,17 @@
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/*.tfvars
+
+# Lambda zip
+lambda/processor/handler.zip
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Locust report
+load_test/report.html
