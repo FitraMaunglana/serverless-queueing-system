@@ -41,6 +41,8 @@ jobs:
       - name: Terraform Apply
         working-directory: terraform
         run: terraform apply -auto-approve -no-color
+        env: 
+          TF_VAR_admin_secret_key: ${{ secrets.ADMIN_SECRET_KEY }}
 
       - name: Show API Endpoint
         working-directory: terraform

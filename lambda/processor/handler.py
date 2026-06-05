@@ -19,84 +19,126 @@ logger.setLevel(logging.INFO)
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ["DYNAMODB_TABLE"])
 
+MAX_TICKETS_PER_USER = 2
+
 
 # ─────────────────────────────────────────
-# Helper — Kurangi quota tiket (atomic)
+# Helper — Cek total tiket yang sudah dibeli user ini
 # ─────────────────────────────────────────
-def reserve_ticket(user_id: str, event_name: str) -> dict:
+def get_user_ticket_count(user_id: str) -> int:
     """
-    Menggunakan conditional update agar tidak terjadi overselling.
-    Jika remaining_tickets sudah 0, operasi gagal dengan ConditionalCheckFailedException.
+    Scan tiket CONFIRMED milik user_id ini.
+    Kembalikan total quantity yang sudah dipesan.
     """
+    response = table.query(
+        IndexName="user_id-index",
+        KeyConditionExpression=boto3.dynamodb.conditions.Key("user_id").eq(user_id),
+        FilterExpression=boto3.dynamodb.conditions.Attr("status").eq("CONFIRMED"),
+    )
+    total = sum(int(item.get("quantity", 1)) for item in response.get("Items", []))
+    return total
+
+
+# ─────────────────────────────────────────
+# Helper — Pesan tiket (atomic, anti-overselling)
+# ─────────────────────────────────────────
+def reserve_ticket(user_id: str, event_name: str, quantity: int) -> dict:
+    """
+    Atomic update quota lalu simpan data pemesanan.
+    Gagal dengan ConditionalCheckFailedException jika tiket tidak cukup.
+    """
+    # Cek apakah user sudah pernah beli
+    existing_count = get_user_ticket_count(user_id)
+    if existing_count + quantity > MAX_TICKETS_PER_USER:
+        remaining_allowed = MAX_TICKETS_PER_USER - existing_count
+        return {
+            "success": False,
+            "reason": "LIMIT_EXCEEDED",
+            "message": f"Maksimal {MAX_TICKETS_PER_USER} tiket per user. "
+                       f"Kamu sudah punya {existing_count} tiket, "
+                       f"sisa slot: {remaining_allowed}.",
+        }
+
     ticket_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    # Langkah 1: Kurangi quota secara atomic
+    # Kurangi quota secara atomic sesuai quantity
     try:
         table.update_item(
             Key={"ticket_id": "QUOTA"},
             UpdateExpression="SET remaining_tickets = remaining_tickets - :val",
-            ConditionExpression="remaining_tickets > :zero",
+            ConditionExpression="remaining_tickets >= :val",
             ExpressionAttributeValues={
-                ":val": 1,
-                ":zero": 0,
+                ":val": quantity,
             },
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            # Cek sisa quota untuk pesan error yang informatif
+            quota_item = table.get_item(Key={"ticket_id": "QUOTA"})
+            remaining = int(quota_item["Item"].get("remaining_tickets", 0))
             return {
                 "success": False,
                 "reason": "SOLD_OUT",
-                "message": "Tiket sudah habis terjual",
+                "message": f"Tiket tidak cukup. Sisa tiket: {remaining}, "
+                           f"kamu minta: {quantity}.",
+                "remaining_tickets": remaining,
             }
         raise e
 
-    # Langkah 2: Simpan data pemesanan
+    # Simpan data pemesanan
     table.put_item(
         Item={
             "ticket_id": ticket_id,
             "user_id": user_id,
             "event_name": event_name,
+            "quantity": quantity,
             "status": "CONFIRMED",
             "created_at": timestamp,
         }
     )
 
-    logger.info(f"Tiket berhasil dipesan | ticket_id={ticket_id} user_id={user_id}")
+    logger.info(
+        f"Tiket berhasil dipesan | ticket_id={ticket_id} "
+        f"user_id={user_id} quantity={quantity}"
+    )
 
     return {
         "success": True,
         "ticket_id": ticket_id,
         "user_id": user_id,
         "event_name": event_name,
+        "quantity": quantity,
         "status": "CONFIRMED",
         "created_at": timestamp,
     }
 
 
 # ─────────────────────────────────────────
-# Helper — Validasi isi pesan dari SQS
+# Helper — Validasi body pesan dari SQS
 # ─────────────────────────────────────────
 def validate_message(body: dict) -> tuple[bool, str]:
-    required_fields = ["user_id", "event_name"]
+    required_fields = ["user_id", "event_name", "quantity"]
 
     for field in required_fields:
         if field not in body:
-            return False, f"Field '{field}' tidak ditemukan dalam request"
-        if not isinstance(body[field], str) or not body[field].strip():
+            return False, f"Field '{field}' tidak ditemukan"
+        if field != "quantity" and not str(body[field]).strip():
             return False, f"Field '{field}' tidak boleh kosong"
+
+    quantity = body["quantity"]
+    if not isinstance(quantity, int) or quantity < 1:
+        return False, "quantity harus berupa angka positif"
+    if quantity > MAX_TICKETS_PER_USER:
+        return False, f"quantity maksimal {MAX_TICKETS_PER_USER} tiket"
 
     return True, ""
 
 
 # ─────────────────────────────────────────
-# Lambda Handler — Entry point utama
+# Lambda Handler
 # ─────────────────────────────────────────
 def lambda_handler(event: dict, context) -> dict:
-    """
-    Dipanggil otomatis oleh AWS setiap kali ada pesan baru di SQS.
-    Satu invokasi bisa memproses beberapa pesan sekaligus (batch).
-    """
     records = event.get("Records", [])
     logger.info(f"Memproses batch: {len(records)} pesan")
 
@@ -105,6 +147,7 @@ def lambda_handler(event: dict, context) -> dict:
         "success": 0,
         "failed": 0,
         "sold_out": 0,
+        "limit_exceeded": 0,
     }
 
     batch_item_failures = []
@@ -113,42 +156,40 @@ def lambda_handler(event: dict, context) -> dict:
         message_id = record["messageId"]
 
         try:
-            # Parse body pesan dari SQS
             body = json.loads(record["body"])
-            logger.info(f"Memproses pesan | message_id={message_id} body={body}")
+            logger.info(f"Memproses | message_id={message_id} body={body}")
 
-            # Validasi field
             is_valid, error_msg = validate_message(body)
             if not is_valid:
-                logger.warning(f"Pesan tidak valid | message_id={message_id} error={error_msg}")
+                logger.warning(f"Pesan tidak valid | {error_msg}")
                 results["failed"] += 1
                 continue
 
-            # Proses pemesanan tiket
             result = reserve_ticket(
                 user_id=body["user_id"],
                 event_name=body["event_name"],
+                quantity=int(body["quantity"]),
             )
 
             if result["success"]:
                 results["success"] += 1
                 logger.info(f"Sukses | ticket_id={result['ticket_id']}")
-            else:
+            elif result["reason"] == "SOLD_OUT":
                 results["sold_out"] += 1
-                logger.warning(f"Tiket habis | user_id={body['user_id']}")
+                logger.warning(f"Tiket habis | {result['message']}")
+            elif result["reason"] == "LIMIT_EXCEEDED":
+                results["limit_exceeded"] += 1
+                logger.warning(f"Limit exceeded | {result['message']}")
 
         except json.JSONDecodeError as e:
-            logger.error(f"Gagal parse JSON | message_id={message_id} error={str(e)}")
+            logger.error(f"Gagal parse JSON | message_id={message_id} | {str(e)}")
             results["failed"] += 1
-            # Masukkan ke batch failures agar SQS kirim ke DLQ
             batch_item_failures.append({"itemIdentifier": message_id})
 
         except Exception as e:
-            logger.error(f"Error tidak terduga | message_id={message_id} error={str(e)}")
+            logger.error(f"Error | message_id={message_id} | {str(e)}")
             results["failed"] += 1
             batch_item_failures.append({"itemIdentifier": message_id})
 
     logger.info(f"Hasil batch: {results}")
-
-    # Kembalikan pesan gagal ke SQS untuk dicoba ulang (max 3x lalu ke DLQ)
     return {"batchItemFailures": batch_item_failures}

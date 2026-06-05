@@ -7,9 +7,13 @@ resource "aws_apigatewayv2_api" "ticket_api" {
   description   = "Serverless Ticket Queueing System API"
 
   cors_configuration {
-    allow_origins = ["https://fitramaulana.my.id"]
+    allow_origins = [
+      "https://fitramaulana.my.id",
+      "https://d1c4isbckgsrol.cloudfront.net",
+      "http://localhost:3000",
+    ]
     allow_methods = ["POST", "GET", "OPTIONS"]
-    allow_headers = ["Content-Type", "Authorization"]
+    allow_headers = ["Content-Type", "Authorization", "x-admin-key"]
     max_age       = 300
   }
 
@@ -76,12 +80,6 @@ resource "aws_apigatewayv2_integration" "sqs_integration" {
 # ─────────────────────────────────────────
 # Routes — Endpoint yang tersedia
 # ─────────────────────────────────────────
-resource "aws_apigatewayv2_route" "buy_ticket" {
-  api_id    = aws_apigatewayv2_api.ticket_api.id
-  route_key = "POST /buy"
-  target    = "integrations/${aws_apigatewayv2_integration.sqs_integration.id}"
-}
-
 resource "aws_apigatewayv2_route" "health_check" {
   api_id    = aws_apigatewayv2_api.ticket_api.id
   route_key = "GET /health"
@@ -127,6 +125,96 @@ resource "aws_cloudwatch_log_group" "apigw_logs" {
     Project     = var.project_name
     Environment = var.environment
   }
+}
+
+# ─────────────────────────────────────────
+# Lambda Permissions — izin API Gateway invoke Lambda
+# ─────────────────────────────────────────
+resource "aws_lambda_permission" "apigw_query" {
+  statement_id  = "AllowAPIGatewayInvokeQuery"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ticket_query.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.ticket_api.execution_arn}/*/*"
+}
+
+resource "aws_lambda_permission" "apigw_admin" {
+  statement_id  = "AllowAPIGatewayInvokeAdmin"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ticket_admin.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.ticket_api.execution_arn}/*/*"
+}
+
+# ─────────────────────────────────────────
+# Integrations — Query & Admin Lambda
+# ─────────────────────────────────────────
+resource "aws_apigatewayv2_integration" "query_integration" {
+  api_id                 = aws_apigatewayv2_api.ticket_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.ticket_query.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_integration" "admin_integration" {
+  api_id                 = aws_apigatewayv2_api.ticket_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.ticket_admin.invoke_arn
+  payload_format_version = "2.0"
+}
+
+# ─────────────────────────────────────────
+# Routes — Query (publik)
+# ─────────────────────────────────────────
+resource "aws_apigatewayv2_route" "get_stats" {
+  api_id    = aws_apigatewayv2_api.ticket_api.id
+  route_key = "GET /stats"
+  target    = "integrations/${aws_apigatewayv2_integration.query_integration.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_status" {
+  api_id    = aws_apigatewayv2_api.ticket_api.id
+  route_key = "GET /status/{ticket_id}"
+  target    = "integrations/${aws_apigatewayv2_integration.query_integration.id}"
+}
+
+# ─────────────────────────────────────────
+# Routes — Admin (protected)
+# ─────────────────────────────────────────
+resource "aws_apigatewayv2_route" "admin_reset" {
+  api_id    = aws_apigatewayv2_api.ticket_api.id
+  route_key = "POST /admin/reset"
+  target    = "integrations/${aws_apigatewayv2_integration.admin_integration.id}"
+}
+
+resource "aws_apigatewayv2_route" "admin_stats" {
+  api_id    = aws_apigatewayv2_api.ticket_api.id
+  route_key = "GET /admin/stats"
+  target    = "integrations/${aws_apigatewayv2_integration.admin_integration.id}"
+}
+
+# ─────────────────────────────────────────
+# Lambda API Handler — Permission + Integration + Route
+# ─────────────────────────────────────────
+resource "aws_lambda_permission" "apigw_api_handler" {
+  statement_id  = "AllowAPIGatewayInvokeApiHandler"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ticket_api_handler.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.ticket_api.execution_arn}/*/*"
+}
+
+resource "aws_apigatewayv2_integration" "api_handler_integration" {
+  api_id                 = aws_apigatewayv2_api.ticket_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.ticket_api_handler.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "buy_ticket_v2" {
+  api_id    = aws_apigatewayv2_api.ticket_api.id
+  route_key = "POST /buy"
+  target    = "integrations/${aws_apigatewayv2_integration.api_handler_integration.id}"
 }
 
 # ─────────────────────────────────────────

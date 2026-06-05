@@ -27,3 +27,9 @@ variable "lambda_batch_size" {
   type        = number
   default     = 10
 }
+
+variable "admin_secret_key" {
+  description = "Secret key untuk endpoint admin reset quota"
+  type        = string
+  sensitive   = true
+}
